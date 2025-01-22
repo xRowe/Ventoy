@@ -209,11 +209,20 @@ ventoy_check_dm_module() {
         vtlog "modprobe failed, now try to insmod ko..."
     
         $FIND /lib/modules/ -name "dm-mod.ko*" | while read vtline; do
-            vtlog "insmode $vtline "
+            vtlog "insmod $vtline "
             $BUSYBOX_PATH/insmod $vtline >>$VTLOG 2>&1
+            if [ $? -eq 0 ]; then
+                vtlog "insmod success"
+            else
+                vtlog "insmod failed, try decompress"
+                if echo $vtline | $GREP -q "\.zst"; then
+                    $VTOY_PATH/tool/zstdcat $vtline > $VTOY_PATH/extract_dm_mod.ko
+                    $BUSYBOX_PATH/insmod $VTOY_PATH/extract_dm_mod.ko >>$VTLOG 2>&1
+                fi
+            fi
         done
     fi
-    
+
     if $GREP -q 'device-mapper' /proc/devices; then
         vtlog "device-mapper found in /proc/devices after retry"
         $BUSYBOX_PATH/true; return
@@ -292,6 +301,7 @@ ventoy_need_dm_patch() {
 }
 
 ventoy_dm_patch() {
+    vtDmPatchDebug=0
     vtMType=$($BUSYBOX_PATH/uname -m)
 
     vtlog "######### ventoy_dm_patch ############"
@@ -325,14 +335,32 @@ ventoy_dm_patch() {
     $CAT /proc/kallsyms | $BUSYBOX_PATH/sort > $VTOY_PATH/kallsyms
     
     if $GREP -m1 -q 'open_table_device.isra' $VTOY_PATH/kallsyms; then
-        vtLine=$($VTOY_PATH/tool/vtoyksym open_table_device.isra $VTOY_PATH/kallsyms)
-        vtlog "get open_table_device.isra address $vtLine"
+        vtISRA=$($GREP -m1 'open_table_device.isra' $VTOY_PATH/kallsyms | $AWK '{print $3}')
+        vtLine=$($VTOY_PATH/tool/vtoyksym $vtISRA $VTOY_PATH/kallsyms)
+        vtlog "get $vtISRA address $vtLine"
     else
         vtLine=$($VTOY_PATH/tool/vtoyksym dm_get_table_device $VTOY_PATH/kallsyms)
         vtlog "get dm_get_table_device address $vtLine"
     fi 
     get_addr=$(echo $vtLine | $AWK '{print $1}')
     get_size=$(echo $vtLine | $AWK '{print $2}')
+
+    vtLine=$($VTOY_PATH/tool/vtoyksym blkdev_get_by_dev $VTOY_PATH/kallsyms) 
+    vtlog "get blkdev_get_by_dev address $vtLine"        
+    blkdev_get_addr=$(echo $vtLine | $AWK '{print $1}')
+    
+    vtLine=$($VTOY_PATH/tool/vtoyksym blkdev_put $VTOY_PATH/kallsyms) 
+    vtlog "get blkdev_put address $vtLine"        
+    blkdev_put_addr=$(echo $vtLine | $AWK '{print $1}')
+    
+    vtLine=$($VTOY_PATH/tool/vtoyksym bdev_open_by_dev $VTOY_PATH/kallsyms) 
+    vtlog "get bdev_open_by_dev address $vtLine"        
+    bdev_open_addr=$(echo $vtLine | $AWK '{print $1}')
+    
+    vtLine=$($VTOY_PATH/tool/vtoyksym bdev_file_open_by_dev $VTOY_PATH/kallsyms) 
+    vtlog "get bdev_file_open_by_dev address $vtLine"        
+    bdev_file_open_addr=$(echo $vtLine | $AWK '{print $1}')
+    
 
     if $GREP -m1 -q 'close_table_device.isra' $VTOY_PATH/kallsyms; then
         vtLine=$($VTOY_PATH/tool/vtoyksym close_table_device.isra $VTOY_PATH/kallsyms)
@@ -350,6 +378,15 @@ ventoy_dm_patch() {
     kprobe_unreg_addr=$($GREP ' unregister_kprobe$' /proc/kallsyms | $AWK '{print $1}')
     
     if [ "$VTOY_DEBUG_LEVEL" = "01" ]; then
+        vtDmPatchDebug=1
+    fi
+    
+    if $GREP -q 'dmpatch_debug' /proc/cmdline; then
+        vtDmPatchDebug=1
+    fi
+    
+    
+    if [ $vtDmPatchDebug -eq 1 ]; then
         printk_addr=$($GREP ' printk$' /proc/kallsyms | $AWK '{print $1}')
         if [ -z "$printk_addr" ]; then
             printk_addr=$($GREP ' _printk$' /proc/kallsyms | $AWK '{print $1}')
@@ -364,8 +401,9 @@ ventoy_dm_patch() {
     
     vtlog get_addr=$get_addr  get_size=$get_size
     vtlog put_addr=$put_addr  put_size=$put_size
+    vtlog blkdev_get_addr=$blkdev_get_addr blkdev_put_addr=$blkdev_put_addr
     vtlog kprobe_reg_addr=$kprobe_reg_addr  kprobe_unreg_addr=$kprobe_unreg_addr
-    vtlog ro_addr=$ro_addr  rw_addr=$rw_addr  printk_addr=$printk_addr
+    vtlog ro_addr=$ro_addr  rw_addr=$rw_addr  printk_addr=$printk_addr bdev_open_addr=$bdev_open_addr bdev_file_open_addr=$bdev_file_open_addr
 
     if [ "$get_addr" = "0" -o "$put_addr" = "0" ]; then
         vtlog "Invalid symbol address"
@@ -378,20 +416,26 @@ ventoy_dm_patch() {
 
 
     vtKv=$($BUSYBOX_PATH/uname -r)
+    vtKVMajor=$(echo $vtKv | $AWK -F. '{print $1}')
+    vtKVMinor=$(echo $vtKv | $AWK -F. '{print $2}')
+    vtKVSubMinor=$(echo $vtKv | $AWK -F. '{print $3}')
     
     if [ ! -d /lib/modules/$vtKv ]; then
         vtlog "No modules directory found"
         return
     elif [ -d /lib/modules/$vtKv/kernel/fs ]; then
         vtModPath=$($FIND /lib/modules/$vtKv/kernel/fs/ -name "*.ko*" | $HEAD -n1)
-    else
+    elif [ -d /lib/modules/$vtKv/kernel ]; then
         vtModPath=$($FIND /lib/modules/$vtKv/kernel/ -name "xfs.ko*" | $HEAD -n1)
+    elif [ -d /lib/modules/$vtKv/initrd ]; then
+        vtModPath=$($FIND /lib/modules/$vtKv/initrd/ -name "xfs.ko*" | $HEAD -n1)
     fi
-    
+
+
     if [ -z "$vtModPath" ]; then
-        vtModPath=$($FIND /lib/modules/$vtKv/kernel/ -name "*.ko*" | $HEAD -n1)
+        vtModPath=$($FIND /lib/modules/$vtKv/ -name "*.ko*" | $HEAD -n1)
     fi
-    
+
     vtModName=$($BUSYBOX_PATH/basename $vtModPath)
     
     vtlog "template module is $vtModPath $vtModName"
@@ -405,6 +449,8 @@ ventoy_dm_patch() {
         $BUSYBOX_PATH/xzcat $vtModPath > $VTOY_PATH/$vtModName
     elif echo $vtModPath | $GREP -q "[.]ko[.]gz$"; then
         $BUSYBOX_PATH/zcat $vtModPath > $VTOY_PATH/$vtModName
+    elif echo $vtModPath | $GREP -q "[.]ko[.]zst$"; then
+        $VTOY_PATH/tool/zstdcat $vtModPath > $VTOY_PATH/$vtModName
     else
         vtlog "unsupport module type"
         return
@@ -413,18 +459,27 @@ ventoy_dm_patch() {
        
     
     #step1: modify vermagic/mod crc/relocation
-    vtlog "$VTOY_PATH/tool/vtoykmod -u $VTOY_PATH/tool/$vtKoName $VTOY_PATH/$vtModName $vtDebug"
-    $VTOY_PATH/tool/vtoykmod -u $VTOY_PATH/tool/$vtKoName $VTOY_PATH/$vtModName $vtDebug
+    vtlog "$VTOY_PATH/tool/vtoykmod -u $vtKVMajor $vtKVMinor $VTOY_PATH/tool/$vtKoName $VTOY_PATH/$vtModName $vtDebug"
+    $VTOY_PATH/tool/vtoykmod -u $vtKVMajor $vtKVMinor $VTOY_PATH/tool/$vtKoName $VTOY_PATH/$vtModName $vtDebug >>$VTLOG 2>&1
     
     #step2: fill parameters
     vtPgsize=$($VTOY_PATH/tool/vtoyksym -p)
-    vtlog "$VTOY_PATH/tool/vtoykmod -f $VTOY_PATH/tool/$vtKoName $vtPgsize 0x$printk_addr 0x$ro_addr 0x$rw_addr $get_addr $get_size $put_addr $put_size 0x$kprobe_reg_addr 0x$kprobe_unreg_addr $vtKv $vtIBT $vtDebug"
-    $VTOY_PATH/tool/vtoykmod -f $VTOY_PATH/tool/$vtKoName $vtPgsize 0x$printk_addr 0x$ro_addr 0x$rw_addr $get_addr $get_size $put_addr $put_size 0x$kprobe_reg_addr 0x$kprobe_unreg_addr $vtKv $vtIBT $vtDebug
+    
+    vtPrams="$VTOY_PATH/tool/$vtKoName $vtPgsize 0x$printk_addr 0x$ro_addr 0x$rw_addr $get_addr $get_size $put_addr $put_size 0x$kprobe_reg_addr 0x$kprobe_unreg_addr $vtKVMajor $vtIBT $vtKVMinor $blkdev_get_addr $blkdev_put_addr $vtKVSubMinor $bdev_open_addr $bdev_file_open_addr  $vtDebug"
+    
+    
+    vtlog "$VTOY_PATH/tool/vtoykmod -f $vtPrams"
+    $VTOY_PATH/tool/vtoykmod -f $vtPrams >>$VTLOG 2>&1
 
-    $BUSYBOX_PATH/insmod $VTOY_PATH/tool/$vtKoName
+
+    vtlog "insmod $VTOY_PATH/tool/$vtKoName"
+    $BUSYBOX_PATH/insmod $VTOY_PATH/tool/$vtKoName  >>$VTLOG 2>&1
     
     if $GREP -q 'dm_patch' /proc/modules; then
+        vtlog "dm_patch module OK"
         echo "done" > $VTOY_PATH/dm_patch_done
+    else
+        vtlog "dm_patch module FAILED"
     fi
     
 }
